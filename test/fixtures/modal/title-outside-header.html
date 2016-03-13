@@ -17,8 +17,8 @@
         <script src="../generic-qunit.js"></script>
     </head>
     <body>
-        <div class="modal fade">
-            <div class="modal-dialog">
+        <div class="modal fade" tabindex="-1" role="dialog">
+            <div class="modal-dialog" role="document">
                 <div class="modal-content">
                     <h4 class="modal-title">Modal title but I should be inside a modal header</h4>
                     <div class="modal-body">
@@ -34,7 +34,7 @@
 
         <div id="qunit"></div>
         <ol id="bootlint">
-            <li data-lint=".modal-title must be a child of .modal-header"></li>
+            <li data-lint="`.modal-title` must be a child of `.modal-header`"></li>
         </ol>
     </body>
 </html>

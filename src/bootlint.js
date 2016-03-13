@@ -1,14 +1,18 @@
 /*!
  * Bootlint - an HTML linter for Bootstrap projects
  * https://github.com/twbs/bootlint
- * Copyright (c) 2014 Christopher Rebert
+ * Copyright (c) 2014-2015 Christopher Rebert
  * Licensed under the MIT License.
  */
 
 /*eslint-env node */
 
 var cheerio = require('cheerio');
+var parseUrl = require('url').parse;
 var semver = require('semver');
+var voidElements = require('void-elements');
+var _location = require('./location');
+var LocationIndex = _location.LocationIndex;
 
 (function (exports) {
     'use strict';
@@ -30,7 +34,32 @@ var semver = require('semver');
     };
     var NUM2SCREEN = ['xs', 'sm', 'md', 'lg'];
     var IN_NODE_JS = !!(cheerio.load);
-    var MIN_JQUERY_VERSION = '1.9.0';// as of Bootstrap v3.2.0
+    var MIN_JQUERY_VERSION = '1.9.1';// as of Bootstrap v3.3.0
+    var CURRENT_BOOTSTRAP_VERSION = '3.3.6';
+    var BOOTSTRAP_VERSION_4 = '4.0.0';
+    var PLUGINS = [
+        'affix',
+        'alert',
+        'button',
+        'carousel',
+        'collapse',
+        'dropdown',
+        'modal',
+        'popover',
+        'scrollspy',
+        'tab',
+        'tooltip'
+    ];
+    var BOOTSTRAP_FILES = [
+        'link[rel="stylesheet"][href$="/bootstrap.css"]',
+        'link[rel="stylesheet"][href="bootstrap.css"]',
+        'link[rel="stylesheet"][href$="/bootstrap.min.css"]',
+        'link[rel="stylesheet"][href="bootstrap.min.css"]',
+        'script[src$="/bootstrap.js"]',
+        'script[src="bootstrap.js"]',
+        'script[src$="/bootstrap.min.js"]',
+        'script[src="bootstrap.min.js"]'
+    ].join(',');
 
     function compareNums(a, b) {
         return a - b;
@@ -39,6 +68,13 @@ var semver = require('semver');
     function isDoctype(node) {
         return node.type === 'directive' && node.name === '!doctype';
     }
+
+    var tagNameOf = IN_NODE_JS ? function (element) {
+        return element.name.toUpperCase();
+    } : function (element) {
+        /* @covignore */
+        return element.tagName.toUpperCase();
+    };
 
     function filenameFromUrl(url) {
         var filename = url.replace(/[#?].*$/, ''); // strip querystring & fragment ID
@@ -64,7 +100,7 @@ var semver = require('semver');
     /**
      * Moves any grid column classes to the end of the class string and sorts the grid classes by ascending screen size.
      * @param {string} classes The "class" attribute of a DOM node
-     * @returns {string}
+     * @returns {string} The processed "class" attribute value
      */
     function sortedColumnClasses(classes) {
         // extract column classes
@@ -121,7 +157,7 @@ var semver = require('semver');
      *      [0, 2, 3, 4, 6, 8, 9, 11] has two such runs: [2, 3, 4], [8, 9]
      *      [0, 2, 4] has no runs.
      * @param {integer[]} list Sorted array of integers
-     * @returns {integer[][]} Array of pairs of start and end values of runs
+     * @returns {Array.<Array.<integer>>} Array of pairs of start and end values of runs
      */
     function incrementingRunsFrom(list) {
         list = list.concat([Infinity]);// use Infinity to ensure any nontrivial (length >= 2) run ends before the end of the loop
@@ -150,6 +186,87 @@ var semver = require('semver');
         return runs;
     }
 
+    /**
+     * This function returns the browser window object, or null if this is not running in a browser environment.
+     * @returns {(Window|null)}
+     */
+    function getBrowserWindowObject() {
+        var theWindow = null;
+        try {
+            /*eslint-disable no-undef, block-scoped-var */
+            theWindow = window;// jshint ignore:line
+            /*eslint-enable no-undef, block-scoped-var */
+        }
+        catch (e) {
+            // deliberately do nothing
+            // empty
+        }
+
+        return theWindow;
+    }
+
+    function versionsIn(strings) {
+        return strings.map(function (str) {
+            var match = str.match(/^\d+\.\d+\.\d+$/);
+            return match ? match[0] : null;
+        }).filter(function (match) {
+            return match !== null;
+        });
+    }
+
+    function versionInLinkedElement($, element) {
+        var elem = $(element);
+        var urlAttr = (tagNameOf(element) === 'LINK') ? 'href' : 'src';
+        var pathSegments = parseUrl(elem.attr(urlAttr)).pathname.split('/');
+        var versions = versionsIn(pathSegments);
+        if (!versions.length) {
+            return null;
+        }
+        var version = versions[versions.length - 1];
+        return version;
+    }
+
+    function jqueryPluginVersions(jQuery) {
+        /* @covignore */
+        return PLUGINS.map(function (pluginName) {
+            var plugin = jQuery.fn[pluginName];
+            if (!plugin) {
+                return undefined;
+            }
+            var constructor = plugin.Constructor;
+            if (!constructor) {
+                return undefined;
+            }
+            return constructor.VERSION;
+        }).filter(function (version) {
+            return version !== undefined;
+        }).sort(semver.compare);
+    }
+
+    function bootstrapScriptsIn($) {
+        var longhands = $('script[src*="bootstrap.js"]').filter(function (i, script) {
+            var url = $(script).attr('src');
+            var filename = filenameFromUrl(url);
+            return filename === "bootstrap.js";
+        });
+        var minifieds = $('script[src*="bootstrap.min.js"]').filter(function (i, script) {
+            var url = $(script).attr('src');
+            var filename = filenameFromUrl(url);
+            return filename === "bootstrap.min.js";
+        });
+
+        return {
+            longhands: longhands,
+            minifieds: minifieds
+        };
+    }
+
+    /**
+     * @param {integer} id Unique string ID for this type of lint error. Of the form "E###" (e.g. "E123").
+     * @param {string} message Human-readable string describing the error
+     * @param {jQuery} elements jQuery or Cheerio collection of referenced DOM elements pointing to all problem locations in the document
+     * @class
+     */
     function LintError(id, message, elements) {
         this.id = id;
         this.message = message;
@@ -157,6 +274,12 @@ var semver = require('semver');
     }
     exports.LintError = LintError;
 
+    /**
+     * @param {integer} id Unique string ID for this type of lint warning. Of the form "W###" (e.g. "W123").
+     * @param {string} message Human-readable string describing the warning
+     * @param {jQuery} elements jQuery or Cheerio collection of referenced DOM elements pointing to all problem locations in the document
+     * @class
+     */
     function LintWarning(id, message, elements) {
         this.id = id;
         this.message = message;
@@ -196,6 +319,272 @@ var semver = require('semver');
     }
 
 
+    addLinter("W001", function lintMetaCharsetUtf8($, reporter) {
+        var meta = $('head>meta[charset]');
+        var charset = meta.attr('charset');
+        if (!charset) {
+            reporter('`<head>` is missing UTF-8 charset `<meta>` tag');
+        }
+        else if (charset.toLowerCase() !== "utf-8") {
+            reporter('charset `<meta>` tag is specifying a legacy, non-UTF-8 charset', meta);
+        }
+    });
+    addLinter("W002", function lintXUaCompatible($, reporter) {
+        var meta = $([
+            'head>meta[http-equiv="X-UA-Compatible"][content="IE=edge"]',
+            'head>meta[http-equiv="x-ua-compatible"][content="ie=edge"]'
+        ].join(','));
+        if (!meta.length) {
+            reporter("`<head>` is missing X-UA-Compatible `<meta>` tag that disables old IE compatibility modes");
+        }
+    });
+    addLinter("W003", function lintViewport($, reporter) {
+        var meta = $('head>meta[name="viewport"][content]');
+        if (!meta.length) {
+            reporter("`<head>` is missing viewport `<meta>` tag that enables responsiveness");
+        }
+    });
+    addLinter("W004", function lintRemoteModals($, reporter) {
+        var remoteModalTriggers = $('[data-toggle="modal"][data-remote]');
+        if (remoteModalTriggers.length) {
+            reporter("Found one or more modals using the deprecated `remote` option", remoteModalTriggers);
+        }
+    });
+    addLinter("W005", function lintJquery($, reporter) {
+        var OLD_JQUERY = "Found what might be an outdated version of jQuery; Bootstrap requires jQuery v" + MIN_JQUERY_VERSION + " or higher";
+        var NO_JQUERY_BUT_BS_JS = "Unable to locate jQuery, which is required for Bootstrap's JavaScript plugins to work";
+        var NO_JQUERY_NOR_BS_JS = "Unable to locate jQuery, which is required for Bootstrap's JavaScript plugins to work; however, you might not be using Bootstrap's JavaScript";
+        var bsScripts = bootstrapScriptsIn($);
+        var hasBsJs = !!(bsScripts.minifieds.length || bsScripts.longhands.length);
+        var theWindow = null;
+        try {
+            /*eslint-disable no-undef, block-scoped-var */
+            theWindow = window;// jshint ignore:line
+            /*eslint-enable no-undef, block-scoped-var */
+        }
+        catch (e) {
+            // deliberately do nothing
+            // empty
+        }
+        /* @covignore */
+        if (theWindow) {
+            // check browser global jQuery
+            var globaljQuery = theWindow.$ || theWindow.jQuery;
+            if (globaljQuery) {
+                var globalVersion = null;
+                try {
+                    globalVersion = globaljQuery.fn.jquery.split(' ')[0];
+                }
+                catch (e) {
+                    // skip; not actually jQuery?
+                    // empty
+                }
+                if (globalVersion) {
+                    // pad out short version numbers (e.g. '1.7')
+                    while (globalVersion.match(/\./g).length < 2) {
+                        globalVersion += ".0";
+                    }
+
+                    var upToDate = null;
+                    try {
+                        upToDate = semver.gte(globalVersion, MIN_JQUERY_VERSION, true);
+                    }
+                    catch (e) {
+                        // invalid version number
+                        // empty
+                    }
+                    if (upToDate === false) {
+                        reporter(OLD_JQUERY);
+                    }
+                    if (upToDate !== null) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // check for jQuery <script>s
+        var jqueries = $([
+            'script[src*="jquery"]',
+            'script[src*="jQuery"]'
+        ].join(','));
+        if (!jqueries.length) {
+            reporter(hasBsJs ? NO_JQUERY_BUT_BS_JS : NO_JQUERY_NOR_BS_JS);
+            return;
+        }
+        jqueries.each(function () {
+            var script = $(this);
+            var pathSegments = parseUrl(script.attr('src')).pathname.split('/');
+            var filename = pathSegments[pathSegments.length - 1];
+            if (!/^j[qQ]uery(\.min)?\.js$/.test(filename)) {
+                return;
+            }
+            var versions = versionsIn(pathSegments);
+            if (!versions.length) {
+                return;
+            }
+            var version = versions[versions.length - 1];
+            if (!semver.gte(version, MIN_JQUERY_VERSION, true)) {
+                reporter(OLD_JQUERY, script);
+            }
+        });
+    });
+    addLinter("W006", function lintTooltipsOnDisabledElems($, reporter) {
+        var selector = [
+            '[disabled][data-toggle="tooltip"]',
+            '.disabled[data-toggle="tooltip"]',
+            '[disabled][data-toggle="popover"]',
+            '.disabled[data-toggle="popover"]'
+        ].join(',');
+        var disabledWithTooltips = $(selector);
+        if (disabledWithTooltips.length) {
+            reporter(
+                "Tooltips and popovers on disabled elements cannot be triggered by user interaction unless the element becomes enabled." +
+                " To have tooltips and popovers be triggerable by the user even when their associated element is disabled," +
+                " put the disabled element inside a wrapper `<div>` and apply the tooltip or popover to the wrapper `<div>` instead.",
+                disabledWithTooltips
+            );
+        }
+    });
+    addLinter("W007", function lintBtnType($, reporter) {
+        var badBtnType = $('button:not([type="submit"], [type="reset"], [type="button"])');
+        if (badBtnType.length) {
+            reporter("Found one or more `<button>`s missing a `type` attribute.", badBtnType);
+        }
+    });
+    addLinter("W008", function lintTooltipsInBtnGroups($, reporter) {
+        var nonBodyContainers = $('.btn-group [data-toggle="tooltip"]:not([data-container="body"]), .btn-group [data-toggle="popover"]:not([data-container="body"])');
+        if (nonBodyContainers.length) {
+            reporter("Tooltips and popovers within button groups should have their `container` set to `'body'`. Found tooltips/popovers that might lack this setting.", nonBodyContainers);
+        }
+    });
+    addLinter("W009", function lintEmptySpacerCols($, reporter) {
+        var selector = COL_CLASSES.map(function (colClass) {
+            return colClass + ':not(:last-child)';
+        }).join(',');
+        var columns = $(selector);
+        columns.each(function (_index, col) {
+            var column = $(col);
+            var isVoidElement = voidElements[col.tagName.toLowerCase()];
+            // can't just use :empty because :empty excludes nodes with all-whitespace text content
+            var hasText = !!column.text().trim().length;
+            var hasChildren = !!column.children(':first-child').length;
+            if (hasChildren || hasText || isVoidElement) {
+                return;
+            }
+
+            var colClasses = column.attr('class').split(/\s+/g).filter(function (klass) {
+                return COL_REGEX.test(klass);
+            });
+            colClasses = sortedColumnClasses(colClasses.join(' ')).trim();
+
+            var colRegex = new RegExp('\\b(col-)(' + SCREENS.join('|') + ')(-\\d+)\\b', 'g');
+            var offsetClasses = colClasses.replace(colRegex, '$1$2-offset$3');
+
+            reporter("Using empty spacer columns isn't necessary with Bootstrap's grid. So instead of having an empty grid column with " + '`class="' + colClasses + '"` , just add `class="' + offsetClasses + '"` to the next grid column.', column);
+        });
+    });
+    addLinter("W010", function lintMediaPulls($, reporter) {
+        var mediaPulls = $('.media>.pull-left, .media>.pull-right');
+        if (mediaPulls.length) {
+            reporter('Using `.pull-left` or `.pull-right` as part of the media object component is deprecated as of Bootstrap v3.3.0. Use `.media-left` or `.media-right` instead.', mediaPulls);
+        }
+    });
+    addLinter("W012", function lintNavbarContainers($, reporter) {
+        var navBars = $('.navbar');
+        var containers = [
+            '.container',
+            '.container-fluid'
+        ].join(',');
+        navBars.each(function () {
+            var navBar = $(this);
+            var hasContainerChildren = !!navBar.children(containers).length;
+
+            if (!hasContainerChildren) {
+                reporter("`.navbar`'s first child element should always be either `.container` or `.container-fluid`", navBar);
+            }
+        });
+    });
+    addLinter("W013", function lintOutdatedBootstrap($, reporter) {
+        var OUTDATED_BOOTSTRAP = "Bootstrap version might be outdated. Latest version is at least " + CURRENT_BOOTSTRAP_VERSION + " ; saw what appears to be usage of Bootstrap ";
+        var theWindow = getBrowserWindowObject();
+        var globaljQuery = theWindow && (theWindow.$ || theWindow.jQuery);
+        /* @covignore */
+        if (globaljQuery) {
+            var versions = jqueryPluginVersions(globaljQuery);
+            if (versions.length) {
+                var minVersion = versions[0];
+                if (semver.lt(minVersion, CURRENT_BOOTSTRAP_VERSION, true)) {
+                    reporter(OUTDATED_BOOTSTRAP + minVersion);
+                    return;
+                }
+            }
+        }
+        // check for Bootstrap <link>s and <script>s
+        var bootstraps = $(BOOTSTRAP_FILES);
+        bootstraps.each(function () {
+            var version = versionInLinkedElement($, this);
+            if (version === null) {
+                return;
+            }
+            if (semver.lt(version, CURRENT_BOOTSTRAP_VERSION, true)) {
+                reporter(OUTDATED_BOOTSTRAP + version, $(this));
+            }
+        });
+    });
+    addLinter("W014", function lintCarouselControls($, reporter) {
+        var controls = $('.carousel-indicators > li, .carousel-control');
+        controls.each(function (_index, cont) {
+            var control = $(cont);
+            var target = control.attr('href') || control.attr('data-target');
+            var carousel = $(target);
+
+            if (!carousel.length || carousel.is(':not(.carousel)')) {
+                reporter('Carousel controls and indicators should use `href` or `data-target` to reference an element with class `.carousel`.', control);
+            }
+        });
+    });
+    addLinter("W015", function lintNewBootstrap($, reporter) {
+        var FUTURE_VERSION_ERROR = "Detected what appears to be Bootstrap v4 or later. This version of Bootlint only supports Bootstrap v3.";
+        var theWindow = getBrowserWindowObject();
+
+        var globaljQuery = theWindow && (theWindow.$ || theWindow.jQuery);
+        /* @covignore */
+        if (globaljQuery) {
+            var versions = jqueryPluginVersions(globaljQuery);
+            if (versions.length) {
+                var minVersion = versions[0];
+                if (semver.gte(minVersion, BOOTSTRAP_VERSION_4, true)) {
+                    reporter(FUTURE_VERSION_ERROR);
+                    return;
+                }
+            }
+        }
+        // check for Bootstrap <link>s and <script>s
+        var bootstraps = $(BOOTSTRAP_FILES);
+        bootstraps.each(function () {
+            var version = versionInLinkedElement($, this);
+            if (version === null) {
+                return;
+            }
+            if (semver.gte(version, BOOTSTRAP_VERSION_4, true)) {
+                reporter(FUTURE_VERSION_ERROR, $(this));
+            }
+        });
+    });
+    addLinter("W016", function lintDisabledClassOnButton($, reporter) {
+        var btnsWithDisabledClass = $('button.btn.disabled, input.btn.disabled');
+        if (btnsWithDisabledClass.length) {
+            reporter("Using the `.disabled` class on a `<button>` or `<input>` only changes the appearance of the element. It doesn't prevent the user from interacting with the element (for example, clicking on it or focusing it). If you want to truly disable the element, use the `disabled` attribute instead.", btnsWithDisabledClass);
+        }
+    });
+    addLinter("W017", function lintInputsMissingTypeAttr($, reporter) {
+        var inputsMissingTypeAttr = $('input:not([type])');
+        if (inputsMissingTypeAttr.length) {
+            reporter("Found one or more `<input>`s missing a `type` attribute.", inputsMissingTypeAttr);
+        }
+    });
+
     addLinter("E001", (function () {
         var MISSING_DOCTYPE = "Document is missing a DOCTYPE declaration";
         var NON_HTML5_DOCTYPE = "Document declares a non-HTML5 DOCTYPE";
@@ -219,7 +608,7 @@ var semver = require('semver');
             /* @covignore */
             return function lintDoctype($, reporter) {
                 /*eslint-disable no-undef, block-scoped-var */
-                var doc = window.document;
+                var doc = window.document;// jshint ignore:line
                 /*eslint-enable un-undef, block-scoped-var */
                 if (doc.doctype === null) {
                     reporter(MISSING_DOCTYPE);
@@ -233,28 +622,6 @@ var semver = require('semver');
             };
         }
     })());
-    addLinter("W001", function lintMetaCharsetUtf8($, reporter) {
-        var meta = $('head>meta[charset]');
-        var charset = meta.attr('charset');
-        if (!charset) {
-            reporter('<head> is missing UTF-8 charset <meta> tag');
-        }
-        else if (charset.toLowerCase() !== "utf-8") {
-            reporter('charset <meta> tag is specifying a legacy, non-UTF-8 charset', meta);
-        }
-    });
-    addLinter("W002", function lintXUaCompatible($, reporter) {
-        var meta = $('head>meta[http-equiv="X-UA-Compatible"][content="IE=edge"]');
-        if (!meta.length) {
-            reporter("<head> is missing X-UA-Compatible <meta> tag that disables old IE compatibility modes");
-        }
-    });
-    addLinter("W003", function lintViewport($, reporter) {
-        var meta = $('head>meta[name="viewport"][content]');
-        if (!meta.length) {
-            reporter("<head> is missing viewport <meta> tag that enables responsiveness");
-        }
-    });
     addLinter("E002", function lintBootstrapv2($, reporter) {
         var columnClasses = [];
         for (var n = 1; n <= 12; n++) {
@@ -302,128 +669,20 @@ var semver = require('semver');
             reporter("Found both `.row` and `.col-*-*` used on the same element", rowCols);
         }
     });
-    addLinter("W004", function lintRemoteModals($, reporter) {
-        var remoteModalTriggers = $('[data-toggle="modal"][data-remote]');
-        if (remoteModalTriggers.length) {
-            reporter("Found one or more modals using the deprecated `remote` option", remoteModalTriggers);
-        }
-    });
-    addLinter("W005", function lintJquery($, reporter) {
-        var OLD_JQUERY = "Found what might be an outdated version of jQuery; Bootstrap requires jQuery v" + MIN_JQUERY_VERSION + " or higher";
-        var NO_JQUERY = "Unable to locate jQuery, which is required for Bootstrap's JavaScript plugins to work";
-        var theWindow = null;
-        try {
-            /*eslint-disable no-undef, block-scoped-var */
-            theWindow = window;
-            /*eslint-enable no-undef, block-scoped-var */
-        }
-        catch (e) {
-            // deliberately do nothing
-        }
-        /* @covignore */
-        if (theWindow) {
-            // check browser global jQuery
-            var globaljQuery = theWindow.$ || theWindow.jQuery;
-            if (globaljQuery) {
-                var globalVersion = null;
-                try {
-                    globalVersion = globaljQuery.fn.jquery.split(' ')[0];
-                }
-                catch (e) {
-                    // skip; not actually jQuery?
-                }
-                if (globalVersion) {
-                    // pad out short version numbers (e.g. '1.7')
-                    while (globalVersion.match(/\./g).length < 2) {
-                        globalVersion += ".0";
-                    }
-
-                    var upToDate = null;
-                    try {
-                        upToDate = semver.gte(globalVersion, MIN_JQUERY_VERSION, true);
-                    }
-                    catch (e) {
-                        // invalid version number
-                    }
-                    if (upToDate === false) {
-                        reporter(OLD_JQUERY);
-                    }
-                    if (upToDate !== null) {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // check for jQuery <script>s
-        var jqueries = $('script[src*="jquery"],script[src*="jQuery"]');
-        if (!jqueries.length) {
-            reporter(NO_JQUERY);
-            return;
-        }
-        jqueries.each(function () {
-            var script = $(this);
-            var matches = script.attr('src').match(/\d+\.\d+\.\d+/g);
-            if (!matches) {
-                return;
-            }
-            var version = matches[matches.length - 1];
-            if (!semver.gte(version, MIN_JQUERY_VERSION, true)) {
-                reporter(OLD_JQUERY, script);
-            }
-        });
-    });
     addLinter("E006", function lintInputGroupFormControlTypes($, reporter) {
         var selectInputGroups = $('.input-group select');
         if (selectInputGroups.length) {
-            reporter("`.input-group` contains a <select>; this should be avoided as <select>s cannot be fully styled in WebKit browsers", selectInputGroups);
+            reporter("`.input-group` contains a `<select>`; this should be avoided as `<select>`s cannot be fully styled in WebKit browsers", selectInputGroups);
         }
         var textareaInputGroups = $('.input-group textarea');
         if (textareaInputGroups.length) {
-            reporter("`.input-group` contains a <textarea>; only text-based <input>s are permitted in an `.input-group`", textareaInputGroups);
+            reporter("`.input-group` contains a `<textarea>`; only text-based `<input>`s are permitted in an `.input-group`", textareaInputGroups);
         }
     });
     addLinter("E007", function lintBootstrapJs($, reporter) {
-        var longhands = $('script[src*="bootstrap.js"]').filter(function (i, script) {
-            var url = $(script).attr('src');
-            var filename = filenameFromUrl(url);
-            return filename === "bootstrap.js";
-        });
-        if (!longhands.length) {
-            return;
-        }
-        var minifieds = $('script[src*="bootstrap.min.js"]').filter(function (i, script) {
-            var url = $(script).attr('src');
-            var filename = filenameFromUrl(url);
-            return filename === "bootstrap.min.js";
-        });
-        if (!minifieds.length) {
-            return;
-        }
-
-        reporter("Only one copy of Bootstrap's JS should be included; currently the webpage includes both bootstrap.js and bootstrap.min.js", longhands.add(minifieds));
-    });
-    addLinter("W006", function lintTooltipsOnDisabledElems($, reporter) {
-        var selector = [
-            '[disabled][data-toggle="tooltip"]',
-            '.disabled[data-toggle="tooltip"]',
-            '[disabled][data-toggle="popover"]',
-            '.disabled[data-toggle="popover"]'
-        ].join(',');
-        var disabledWithTooltips = $(selector);
-        if (disabledWithTooltips.length) {
-            reporter(
-                "Tooltips and popovers on disabled elements cannot be triggered by user interaction unless the element becomes enabled." +
-                " To have tooltips and popovers be triggerable by the user even when their associated element is disabled," +
-                " put the disabled element inside a wrapper <div> and apply the tooltip or popover to the wrapper <div> instead.",
-                disabledWithTooltips
-            );
-        }
-    });
-    addLinter("W008", function lintTooltipsInBtnGroups($, reporter) {
-        var nonBodyContainers = $('.btn-group [data-toggle="tooltip"]:not([data-container="body"]), .btn-group [data-toggle="popover"]:not([data-container="body"])');
-        if (nonBodyContainers.length) {
-            reporter("Tooltips and popovers within button groups should have their `container` set to 'body'. Found tooltips/popovers that might lack this setting.", nonBodyContainers);
+        var scripts = bootstrapScriptsIn($);
+        if (scripts.longhands.length && scripts.minifieds.length) {
+            reporter("Only one copy of Bootstrap's JS should be included; currently the webpage includes both bootstrap.js and bootstrap.min.js", scripts.longhands.add(scripts.minifieds));
         }
     });
     addLinter("E009", function lintMissingInputGroupSizes($, reporter) {
@@ -449,7 +708,7 @@ var semver = require('semver');
     addLinter("E011", function lintFormGroupMixedWithInputGroup($, reporter) {
         var badMixes = $('.input-group.form-group');
         if (badMixes.length) {
-            reporter(".input-group and .form-group cannot be used directly on the same element. Instead, nest the .input-group within the .form-group", badMixes);
+            reporter("`.input-group` and `.form-group` cannot be used directly on the same element. Instead, nest the `.input-group` within the `.form-group`", badMixes);
         }
     });
     addLinter("E012", function lintGridClassMixedWithInputGroup($, reporter) {
@@ -459,18 +718,18 @@ var semver = require('semver');
 
         var badMixes = $(selector);
         if (badMixes.length) {
-            reporter(".input-group and .col-*-* cannot be used directly on the same element. Instead, nest the .input-group within the .col-*-*", badMixes);
+            reporter("`.input-group` and `.col-*-*` cannot be used directly on the same element. Instead, nest the `.input-group` within the `.col-*-*`", badMixes);
         }
     });
     addLinter("E013", function lintRowChildrenAreCols($, reporter) {
-        var ALLOWED_CHILD_CLASSES = COL_CLASSES.concat(['.clearfix', '.bs-customizer-input']);
-        var selector = '.row>*' + ALLOWED_CHILD_CLASSES.map(function (colClass) {
+        var ALLOWED_CHILDREN = COL_CLASSES.concat(['script', '.clearfix', '.bs-customizer-input']);
+        var selector = '.row>*' + ALLOWED_CHILDREN.map(function (colClass) {
             return ':not(' + colClass + ')';
         }).join('');
 
         var nonColRowChildren = $(selector);
         if (nonColRowChildren.length) {
-            reporter("Only columns (.col-*-*) may be children of `.row`s", nonColRowChildren);
+            reporter("Only columns (`.col-*-*`) may be children of `.row`s", nonColRowChildren);
         }
     });
     addLinter("E014", function lintColParentsAreRowsOrFormGroups($, reporter) {
@@ -480,7 +739,7 @@ var semver = require('semver');
 
         var colsOutsideRowsAndFormGroups = $(selector);
         if (colsOutsideRowsAndFormGroups.length) {
-            reporter("Columns (.col-*-*) can only be children of `.row`s or `.form-group`s", colsOutsideRowsAndFormGroups);
+            reporter("Columns (`.col-*-*`) can only be children of `.row`s or `.form-group`s", colsOutsideRowsAndFormGroups);
         }
     });
     addLinter("E015", function lintInputGroupsWithMultipleAddOnsPerSide($, reporter) {
@@ -503,12 +762,6 @@ var semver = require('semver');
             reporter("`.btn.dropdown-toggle` must be the last button in a button group.", badBtnToggle);
         }
     });
-    addLinter("W007", function lintBtnType($, reporter) {
-        var badBtnType = $('button:not([type="submit"], [type="reset"], [type="button"])');
-        if (badBtnType.length) {
-            reporter("Found one or more `<button>`s missing a `type` attribute.", badBtnType);
-        }
-    });
     addLinter("E017", function lintBlockCheckboxes($, reporter) {
         var badCheckboxes = $('.checkbox').filter(function (i, div) {
             return $(div).filter(':has(>label>input[type="checkbox"])').length <= 0;
@@ -528,7 +781,7 @@ var semver = require('semver');
     addLinter("E019", function lintInlineCheckboxes($, reporter) {
         var wrongElems = $('.checkbox-inline:not(label)');
         if (wrongElems.length) {
-            reporter(".checkbox-inline should only be used on <label> elements", wrongElems);
+            reporter("`.checkbox-inline` should only be used on `<label>` elements", wrongElems);
         }
         var badStructures = $('.checkbox-inline').filter(function (i, label) {
             return $(label).children('input[type="checkbox"]').length <= 0;
@@ -540,7 +793,7 @@ var semver = require('semver');
     addLinter("E020", function lintInlineRadios($, reporter) {
         var wrongElems = $('.radio-inline:not(label)');
         if (wrongElems.length) {
-            reporter(".radio-inline should only be used on <label> elements", wrongElems);
+            reporter("`.radio-inline` should only be used on `<label>` elements", wrongElems);
         }
         var badStructures = $('.radio-inline').filter(function (i, label) {
             return $(label).children('input[type="radio"]').length <= 0;
@@ -558,11 +811,15 @@ var semver = require('semver');
         ].join(',');
         var mismatchedButtonInputs = $(selector);
         if (mismatchedButtonInputs.length) {
-            reporter(".active class used without the `checked` attribute (or vice-versa) in a button group using the button.js plugin", mismatchedButtonInputs);
+            reporter("`.active` class used without the `checked` attribute (or vice-versa) in a button group using the button.js plugin", mismatchedButtonInputs);
         }
     });
     addLinter("E022", function lintModalsWithinOtherComponents($, reporter) {
-        var badNestings = $('.table .modal');
+        var selector = [
+          '.table .modal',
+          '.navbar .modal'
+        ].join(',');
+        var badNestings = $(selector);
         if (badNestings.length) {
             reporter("Modal markup should not be placed within other components, so as to avoid the component's styles interfering with the modal's appearance or functionality", badNestings);
         }
@@ -594,7 +851,7 @@ var semver = require('semver');
     addLinter("E027", function lintTableResponsive($, reporter) {
         var badStructure = $('.table.table-responsive, table.table-responsive');
         if (badStructure.length) {
-            reporter("`.table-responsive` is supposed to be used on the table's parent wrapper <div>, not on the table itself", badStructure);
+            reporter("`.table-responsive` is supposed to be used on the table's parent wrapper `<div>`, not on the table itself", badStructure);
         }
     });
     addLinter("E028", function lintFormControlFeedbackWithoutHasFeedback($, reporter) {
@@ -643,8 +900,8 @@ var semver = require('semver');
 
             simplifiedClasses = sortedColumnClasses(simplifiedClasses);
             simplifiedClasses = simplifiedClasses.replace(/ {2,}/g, ' ').trim();
-            var oldClass = 'class="' + classes + '"';
-            var newClass = 'class="' + simplifiedClasses + '"';
+            var oldClass = '`class="' + classes + '"`';
+            var newClass = '`class="' + simplifiedClasses + '"`';
             reporter(
                 "Since grid classes apply to devices with screen widths greater than or equal to the breakpoint sizes (unless overridden by grid classes targeting larger screens), " +
                 oldClass + " is redundant and can be simplified to " + newClass,
@@ -657,7 +914,7 @@ var semver = require('semver');
             return /\bglyphicon-([a-zA-Z]+)\b/.test($(this).attr('class'));
         });
         if (missingGlyphiconClass.length) {
-            reporter("Found elements with a .glyphicon-* class that were missing the additional required .glyphicon class.", missingGlyphiconClass);
+            reporter("Found elements with a `.glyphicon-*` class that were missing the additional required `.glyphicon` class.", missingGlyphiconClass);
         }
     });
     addLinter("E031", function lintGlyphiconOnNonEmptyElement($, reporter) {
@@ -671,32 +928,32 @@ var semver = require('semver');
 
         elements = $('.modal-dialog').parent(':not(.modal)');
         if (elements.length) {
-            reporter(".modal-dialog must be a child of .modal", elements);
+            reporter("`.modal-dialog` must be a child of `.modal`", elements);
         }
 
         elements = $('.modal-content').parent(':not(.modal-dialog)');
         if (elements.length) {
-            reporter(".modal-content must be a child of .modal-dialog", elements);
+            reporter("`.modal-content` must be a child of `.modal-dialog`", elements);
         }
 
         elements = $('.modal-header').parent(':not(.modal-content)');
         if (elements.length) {
-            reporter(".modal-header must be a child of .modal-content", elements);
+            reporter("`.modal-header` must be a child of `.modal-content`", elements);
         }
 
         elements = $('.modal-body').parent(':not(.modal-content)');
         if (elements.length) {
-            reporter(".modal-body must be a child of .modal-content", elements);
+            reporter("`.modal-body` must be a child of `.modal-content`", elements);
         }
 
         elements = $('.modal-footer').parent(':not(.modal-content)');
         if (elements.length) {
-            reporter(".modal-footer must be a child of .modal-content", elements);
+            reporter("`.modal-footer` must be a child of `.modal-content`", elements);
         }
 
         elements = $('.modal-title').parent(':not(.modal-header)');
         if (elements.length) {
-            reporter(".modal-title must be a child of .modal-header", elements);
+            reporter("`.modal-title` must be a child of `.modal-header`", elements);
         }
     });
     addLinter("E033", function lintAlertMissingDismissible($, reporter) {
@@ -708,7 +965,9 @@ var semver = require('semver');
     addLinter("E034", function lintAlertDismissStructure($, reporter) {
         var nonFirstChildCloses = $('.alert>.close:not(:first-child)');
         var closesPrecededByText = $('.alert>.close').filter(function () {
-            return !!($(this).parent().contents().eq(0).text().trim());
+            var firstNode = $(this).parent().contents().eq(0);
+            var firstNodeIsText = IN_NODE_JS ? firstNode[0].type === 'text' : firstNode[0].nodeType === 3;
+            return !!(firstNodeIsText && firstNode.text().trim());
         });
         var problematicCloses = nonFirstChildCloses.add(closesPrecededByText);
         if (problematicCloses.length) {
@@ -718,33 +977,173 @@ var semver = require('semver');
     addLinter("E035", function lintFormGroupWithFormClass($, reporter) {
         var badFormGroups = $('.form-group.form-inline, .form-group.form-horizontal');
         if (badFormGroups.length) {
-            reporter('Neither .form-inline nor .form-horizontal should be used directly on a `.form-group`. Instead, nest the .form-group within the .form-inline or .form-horizontal', badFormGroups);
+            reporter('Neither `.form-inline` nor `.form-horizontal` should be used directly on a `.form-group`. Instead, nest the `.form-group` within the `.form-inline` or `.form-horizontal`', badFormGroups);
         }
     });
+    addLinter("E037", function lintColZeros($, reporter) {
+        var selector = SCREENS.map(function (screen) {
+            return ".col-" + screen + "-0";
+        }).join(',');
+        var elements = $(selector);
+        if (elements.length) {
+            reporter("Column widths must be positive integers (and <= 12 by default). Found usage(s) of invalid nonexistent `.col-*-0` classes.", elements);
+        }
+    });
+    addLinter("E038", function lintMediaPulls($, reporter) {
+        var mediaPullsOutsideMedia = $('.media-left, .media-right').filter(function () {
+            return !($(this).parent().closest('.media').length);
+        });
+        if (mediaPullsOutsideMedia.length) {
+            reporter('`.media-left` and `.media-right` should not be used outside of `.media` objects.', mediaPullsOutsideMedia);
+        }
+    });
+    addLinter("E039", function lintNavbarPulls($, reporter) {
+        var navbarPullsOutsideNavbars = $('.navbar-left, .navbar-right').filter(function () {
+            return !($(this).parent().closest('.navbar').length);
+        });
+        if (navbarPullsOutsideNavbars.length) {
+            reporter('`.navbar-left` and `.navbar-right` should not be used outside of navbars.', navbarPullsOutsideNavbars);
+        }
+    });
+    addLinter("E040", function lintModalHide($, reporter) {
+        var modalsWithHide = $('.modal.hide');
+        if (modalsWithHide.length) {
+            reporter('`.hide` should not be used on `.modal` in Bootstrap v3.', modalsWithHide);
+        }
+    });
+    addLinter("E041", function lintCarouselStructure($, reporter) {
+        var carouselsWithWrongInners = $('.carousel').filter(function () {
+            return $(this).children('.carousel-inner').length !== 1;
+        });
+        if (carouselsWithWrongInners.length) {
+            reporter('`.carousel` must have exactly one `.carousel-inner` child.', carouselsWithWrongInners);
+        }
 
-    exports._lint = function ($, reporter, disabledIdList) {
+        var innersWithWrongActiveItems = $('.carousel-inner').filter(function () {
+            return $(this).children('.item.active').length !== 1;
+        });
+        if (innersWithWrongActiveItems.length) {
+            reporter('`.carousel-inner` must have exactly one `.item.active` child.', innersWithWrongActiveItems);
+        }
+    });
+    addLinter("E042", function lintFormControlOnWrongControl($, reporter) {
+        var formControlsOnWrongTags = $('.form-control:not(input,textarea,select)');
+        if (formControlsOnWrongTags.length) {
+            reporter('`.form-control` should only be used on `<input>`s, `<textarea>`s, and `<select>`s.', formControlsOnWrongTags);
+        }
+
+        var formControlsOnWrongTypes = $('input.form-control:not(' + ([
+                'color',
+                'email',
+                'number',
+                'password',
+                'search',
+                'tel',
+                'text',
+                'url',
+                'datetime',
+                'datetime-local',
+                'date',
+                'month',
+                'week',
+                'time'
+            ].map(function (type) {
+                return '[type="' + type + '"]';
+            }).join(',')
+        ) + ')');
+        if (formControlsOnWrongTypes.length) {
+            reporter('`.form-control` cannot be used on non-textual `<input>`s, such as those whose `type` is: `file`, `checkbox`, `radio`, `range`, `button`', formControlsOnWrongTypes);
+        }
+    });
+    addLinter("E043", function lintNavbarNavAnchorButtons($, reporter) {
+        var navbarNavAnchorBtns = $('.navbar-nav a.btn, .navbar-nav a.navbar-btn');
+        if (navbarNavAnchorBtns.length) {
+            reporter('Button classes (`.btn`, `.btn-*`, `.navbar-btn`) cannot be used on `<a>`s within `.navbar-nav`s.', navbarNavAnchorBtns);
+        }
+    });
+    addLinter("E044", function lintInputGroupAddonChildren($, reporter) {
+        var badInputGroups = $('.input-group').filter(function () {
+            var inputGroup = $(this);
+            return !inputGroup.children('.form-control').length || !inputGroup.children('.input-group-addon, .input-group-btn').length;
+        });
+        if (badInputGroups.length) {
+            reporter('`.input-group` must have a `.form-control` and either an `.input-group-addon` or an `.input-group-btn`.', badInputGroups);
+        }
+    });
+    addLinter("E045", function lintImgResponsiveOnNonImgs($, reporter) {
+        var imgResponsiveNotOnImg = $('.img-responsive:not(img)');
+        if (imgResponsiveNotOnImg.length) {
+            reporter('`.img-responsive` should only be used on `<img>`s', imgResponsiveNotOnImg);
+        }
+    });
+    addLinter("E046", function lintModalTabIndex($, reporter) {
+        var modalsWithoutTabindex = $('.modal:not([tabindex])');
+        if (modalsWithoutTabindex.length) {
+            reporter('`.modal` elements must have a `tabindex` attribute.', modalsWithoutTabindex);
+        }
+    });
+    addLinter("E047", function lintBtnElements($, reporter) {
+        var btns = $('.btn:not(a,button,input,label)');
+        if (btns.length) {
+            reporter('`.btn` should only be used on `<a>`, `<button>`, `<input>`, or `<label>` elements.', btns);
+        }
+    });
+    addLinter("E048", function lintModalRole($, reporter) {
+        var modals = $('.modal:not([role="dialog"])');
+        if (modals.length) {
+            reporter('`.modal` must have a `role="dialog"` attribute.', modals);
+        }
+    });
+    addLinter("E049", function lintModalDialogRole($, reporter) {
+        var modalDialogs = $('.modal-dialog:not([role="document"])');
+        if (modalDialogs.length) {
+            reporter('`.modal-dialog` must have a `role="document"` attribute.', modalDialogs);
+        }
+    });
+    exports._lint = function ($, reporter, disabledIdList, html) {
+        var locationIndex = IN_NODE_JS ? new LocationIndex(html) : null;
+        var reporterWrapper = IN_NODE_JS ? function (problem) {
+            if (problem.elements) {
+                problem.elements = problem.elements.each(function (i, element) {
+                    if (element.startIndex !== undefined) {
+                        var location = locationIndex.locationOf(element.startIndex);
+                        if (location) {
+                            element.startLocation = location;
+                        }
+                    }
+                });
+            }
+            reporter(problem);
+        } : reporter;
+
         var disabledIdSet = {};
         disabledIdList.forEach(function (disabledId) {
             disabledIdSet[disabledId] = true;
         });
         Object.keys(allLinters).sort().forEach(function (linterId) {
             if (!disabledIdSet[linterId]) {
-                allLinters[linterId]($, reporter);
+                allLinters[linterId]($, reporterWrapper);
             }
         });
     };
+    /**
+     * @callback reporter
+     * @param {LintWarning|LintError} problem A lint problem
+     * @returns {undefined} Any return value is ignored.
+     */
+
     if (IN_NODE_JS) {
         // cheerio; Node.js
         /**
          * Lints the given HTML.
          * @param {string} html The HTML to lint
-         * @param reporter Function to call with each lint problem
+         * @param {reporter} reporter Function to call with each lint problem
          * @param {string[]} disabledIds Array of string IDs of linters to disable
          * @returns {undefined} Nothing
          */
         exports.lintHtml = function (html, reporter, disabledIds) {
-            var $ = cheerio.load(html);
-            this._lint($, reporter, disabledIds);
+            var $ = cheerio.load(html, {withStartIndices: true});
+            this._lint($, reporter, disabledIds, html);
         };
     }
     else {
@@ -754,7 +1153,7 @@ var semver = require('semver');
             var $ = cheerio;
             /**
              * Lints the HTML of the current document.
-             * @param reporter Function to call with each lint problem
+             * @param {reporter} reporter Function to call with each lint problem
              * @param {string[]} disabledIds Array of string IDs of linters to disable
              * @returns {undefined} Nothing
              */
@@ -766,17 +1165,26 @@ var semver = require('semver');
              * If there are any lint warnings, one general notification message will be window.alert()-ed to the user.
              * Each warning will be output individually using console.warn().
              * @param {string[]} disabledIds Array of string IDs of linters to disable
+             * @param {object} [alertOpts] Options object to configure alert()ing
+             * @param {boolean} [alertOpts.hasProblems=true] Show one alert() when the first lint problem is found?
+             * @param {boolean} [alertOpts.problemFree=true] Show one alert() at the end of linting if the page has no lint problems?
              * @returns {undefined} Nothing
              */
-            exports.showLintReportForCurrentDocument = function (disabledIds) {
+            exports.showLintReportForCurrentDocument = function (disabledIds, alertOpts) {
+                alertOpts = alertOpts || {};
+                var alertOnFirstProblem = alertOpts.hasProblems || alertOpts.hasProblems === undefined;
+                var alertIfNoProblems = alertOpts.problemFree || alertOpts.problemFree === undefined;
+
                 var seenLint = false;
                 var errorCount = 0;
                 var reporter = function (lint) {
                     var background = "background: #" + (lint.id[0] === "W" ? "f0ad4e" : "d9534f") + "; color: #ffffff;";
                     if (!seenLint) {
-                        /*eslint-disable no-alert, no-undef, block-scoped-var */
-                        window.alert("bootlint found errors in this document! See the JavaScript console for details.");
-                        /*eslint-enable no-alert, no-undef, block-scoped-var */
+                        if (alertOnFirstProblem) {
+                            /*eslint-disable no-alert, no-undef, block-scoped-var */
+                            window.alert("bootlint found errors in this document! See the JavaScript console for details.");// jshint ignore:line
+                            /*eslint-enable no-alert, no-undef, block-scoped-var */
+                        }
                         seenLint = true;
                     }
 
@@ -793,9 +1201,14 @@ var semver = require('semver');
                 if (errorCount > 0) {
                     console.info("bootlint: For details, look up the lint problem IDs in the Bootlint wiki: https://github.com/twbs/bootlint/wiki");
                 }
+                else if (alertIfNoProblems) {
+                    /*eslint-disable no-alert, no-undef, block-scoped-var */
+                    window.alert("bootlint found no errors in this document.");// jshint ignore:line
+                    /*eslint-enable no-alert, no-undef, block-scoped-var */
+                }
             };
             /*eslint-disable no-undef, block-scoped-var */
-            window.bootlint = exports;
+            window.bootlint = exports;// jshint ignore:line
             /*eslint-enable no-undef, block-scoped-var */
         })();
     }
