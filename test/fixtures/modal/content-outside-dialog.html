@@ -17,7 +17,7 @@
         <script src="../generic-qunit.js"></script>
     </head>
     <body>
-        <div class="modal fade">
+        <div class="modal fade" tabindex="-1" role="dialog">
             <!--Oops, forgot about the .modal-dialog-->
             <div class="modal-content">
                 <div class="modal-header">
@@ -36,7 +36,7 @@
 
         <div id="qunit"></div>
         <ol id="bootlint">
-            <li data-lint=".modal-content must be a child of .modal-dialog"></li>
+            <li data-lint="`.modal-content` must be a child of `.modal-dialog`"></li>
         </ol>
     </body>
 </html>
